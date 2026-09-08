@@ -12,6 +12,7 @@ from taegis_magic.core.normalizer import TaegisResultsNormalizer
 from taegis_magic.core.service import get_service
 from taegis_sdk_python import ServiceCoreException
 from taegis_sdk_python.services.query_relay.types import (
+    EnrichOptions,
     ExecuteQueryRelayInput,
     FetchQueryRelayResultsInput,
     QueryRelayResult,
@@ -48,6 +49,7 @@ class TaegisQueryRelayNormalizer(TaegisResultsNormalizer):
     """Taegis Query Relay Normalizer."""
 
     raw_results: List[Dict[str, Any]] = field(default_factory=list)
+    correlation_id: Optional[str] = None
 
     @property
     def results(self) -> List[Dict[str, Any]]:
@@ -58,7 +60,10 @@ class TaegisQueryRelayNormalizer(TaegisResultsNormalizer):
 @tracing
 def search(
     cell: Annotated[str, typer.Option(help="SQL query to execute")],
-    workload: Annotated[str, typer.Option(help="QEE workload type for Trino cluster routing")],
+    workload: Annotated[
+        Optional[str],
+        typer.Option(help="QEE workload type for Trino cluster routing (optional; QEE falls back to a default when omitted)"),
+    ] = None,
     time_range_start: Annotated[
         Optional[str], typer.Option(help="ISO8601 start time")
     ] = None,
@@ -66,6 +71,13 @@ def search(
         Optional[str], typer.Option(help="ISO8601 end time")
     ] = None,
     page_size: Annotated[int, typer.Option(help="Results per page")] = 1000,
+    no_enrich_hostname: Annotated[
+        bool,
+        typer.Option(
+            "--no-enrich-hostname",
+            help="Disable host_id to $hostname enrichment (enabled by default)",
+        ),
+    ] = False,
     tenant: Annotated[Optional[str], typer.Option(help="Tenant ID")] = None,
     region: Annotated[Optional[str], typer.Option(help="Taegis Region")] = None,
     progress: Annotated[bool, typer.Option(help="Show progress bars")] = True,
@@ -88,11 +100,14 @@ def search(
         error = response.error
         message = (
             f"Query Relay execution failed to start: {response.status} "
-            f"error={error.error} message={error.message} code={error.code}"
+            f"error={error.error} message={error.message} code={error.code} "
+            f"correlationId={response.correlation_id}"
         )
         log.error(message)
         raise ServiceCoreException(message)
-    log.info(f"Query submitted, token: {token}")
+    log.info(f"Query submitted, token: {token}, correlationId: {response.correlation_id}")
+
+    enrich = EnrichOptions(hostname=not no_enrich_hostname)
 
     # Phase 1: Poll until execution completes
     poll_bar = _get_bar(
@@ -101,7 +116,9 @@ def search(
     try:
         while True:
             poll_response = service.query_relay.query.fetch_query_relay_results(
-                FetchQueryRelayResultsInput(token=token, page_size=page_size)
+                FetchQueryRelayResultsInput(
+                    token=token, page_size=page_size, enrich=enrich
+                )
             )
             if poll_response.status == QueryRelayStatus.FINISHED:
                 if poll_bar is not None:
@@ -122,7 +139,8 @@ def search(
             f"Query Relay execution did not succeed: {poll_response.result} "
             f"error={error.error if error else None} "
             f"message={error.message if error else None} "
-            f"code={error.code if error else None}"
+            f"code={error.code if error else None} "
+            f"correlationId={poll_response.correlation_id}"
         )
         log.error(message)
         raise ServiceCoreException(message)
@@ -145,6 +163,7 @@ def search(
                     token=token,
                     page_size=page_size,
                     next_page_token=next_key,
+                    enrich=enrich,
                 )
             )
             page_rows = page.rows or []
@@ -158,6 +177,7 @@ def search(
 
     return TaegisQueryRelayNormalizer(
         raw_results=all_rows,
+        correlation_id=poll_response.correlation_id,
         service="query_relay",
         tenant_id=service.tenant_id,
         region=service.environment,
@@ -167,6 +187,7 @@ def search(
             "time_range_end": time_range_end,
             "workload": workload,
             "page_size": page_size,
+            "no_enrich_hostname": no_enrich_hostname,
             "tenant": tenant,
             "region": region,
         },
